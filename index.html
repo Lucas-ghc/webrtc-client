@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <title>WebRTC P2P — Minimal</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font-family: system-ui, Arial, sans-serif;
+        max-width: 900px;
+        margin: 24px auto;
+        padding: 0 12px;
+      }
+      video {
+        width: 100%;
+        max-width: 420px;
+        background: #000;
+        border-radius: 8px;
+      }
+      .row {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      .col {
+        flex: 1 1 300px;
+      }
+      input,
+      button {
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px solid #ccc;
+      }
+      button {
+        cursor: pointer;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 8px 0;
+      }
+      small {
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Appel P2P (WebRTC)</h1>
+    <div class="controls">
+      <input id="room" placeholder="room-1234" />
+      <button id="createBtn">Créer & émettre l’offre</button>
+      <button id="joinBtn">Rejoindre (répondre)</button>
+      <button id="hangupBtn" disabled>Raccrocher</button>
+    </div>
+    <small>
+      1) Créateur clique “Créer & émettre l’offre” • 2) L’autre clique
+      “Rejoindre”.
+    </small>
+
+    <div class="row" style="margin-top: 16px">
+      <div class="col">
+        <h3>Moi</h3>
+        <video id="localVideo" autoplay playsinline muted></video>
+      </div>
+      <div class="col">
+        <h3>Remote</h3>
+        <video id="remoteVideo" autoplay playsinline></video>
+      </div>
+    </div>
+
+    <script>
+      // ---- Config ----
+      const SIGNALING_URL = "wss://little-ravens-fix.loca.lt"; // ex: wss://webrtc.example.com
+      const ICE_SERVERS = [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        // Pour réseaux stricts, ajoutez un TURN:
+        {
+          urls: "turn:trun.true-turkeys-say.loca.lt",
+          username: "user",
+          credential: "pass",
+        },
+      ];
+
+      // ---- State ----
+      let pc,
+        ws,
+        localStream,
+        roomId,
+        isCreator = false;
+
+      const els = {
+        room: document.getElementById("room"),
+        createBtn: document.getElementById("createBtn"),
+        joinBtn: document.getElementById("joinBtn"),
+        hangupBtn: document.getElementById("hangupBtn"),
+        localVideo: document.getElementById("localVideo"),
+        remoteVideo: document.getElementById("remoteVideo"),
+      };
+
+      // --- Utils ---
+      function log(...a) {
+        console.log("[APP]", ...a);
+      }
+      function send(msg) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ room: roomId, ...msg }));
+        }
+      }
+
+      // --- Media + PeerConnection setup ---
+      async function ensureMedia() {
+        if (localStream) return;
+        try {
+          // Essayer d'abord vidéo + audio
+          localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
+          els.localVideo.srcObject = localStream;
+        } catch (err) {
+          console.warn(
+            "Impossible d'accéder à la caméra, tentative audio uniquement:",
+            err
+          );
+          try {
+            // Si échec, essayer audio seul
+            localStream = await navigator.mediaDevices.getUserMedia({
+              video: false,
+              audio: true,
+            });
+            els.localVideo.srcObject = null;
+          } catch (err2) {
+            console.warn("Impossible d'accéder au micro:", err2);
+            localStream = new MediaStream(); // Créer un flux vide
+            els.localVideo.srcObject = null;
+          }
+        }
+      }
+
+      function createPeerConnection() {
+        pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+        // Ajoute flux local seulement s'il contient des tracks
+        if (localStream.getTracks().length > 0) {
+          localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+        }
+
+        // Gestion des remote tracks
+        const remoteStream = new MediaStream();
+        els.remoteVideo.srcObject = remoteStream;
+        pc.addEventListener("track", (ev) => {
+          ev.streams[0].getTracks().forEach((t) => remoteStream.addTrack(t));
+        });
+
+        // Envoi des ICE candidates
+        pc.addEventListener("icecandidate", (ev) => {
+          if (ev.candidate) {
+            send({ type: "candidate", candidate: ev.candidate });
+          }
+        });
+
+        // Optionnel: debug
+        pc.addEventListener("connectionstatechange", () => {
+          log("PC state:", pc.connectionState);
+          if (
+            ["disconnected", "failed", "closed"].includes(pc.connectionState)
+          ) {
+            els.hangupBtn.disabled = true;
+          }
+        });
+      }
+
+      // --- WebSocket / signaling ---
+      function connectWS() {
+        return new Promise((resolve, reject) => {
+          ws = new WebSocket(SIGNALING_URL);
+          ws.onopen = () => {
+            log("WS connected");
+            send({ type: "join" });
+            resolve();
+          };
+          ws.onerror = reject;
+          ws.onmessage = async (ev) => {
+            const msg = JSON.parse(ev.data);
+            if (!msg || msg.room !== roomId) return;
+
+            switch (msg.type) {
+              case "offer":
+                log("Offer reçue");
+                await ensureMedia();
+                if (!pc) createPeerConnection();
+                await pc.setRemoteDescription(
+                  new RTCSessionDescription(msg.sdp)
+                );
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                send({ type: "answer", sdp: pc.localDescription });
+                break;
+
+              case "answer":
+                log("Answer reçue");
+                await pc.setRemoteDescription(
+                  new RTCSessionDescription(msg.sdp)
+                );
+                break;
+
+              case "candidate":
+                if (msg.candidate) {
+                  try {
+                    await pc.addIceCandidate(
+                      new RTCIceCandidate(msg.candidate)
+                    );
+                  } catch (e) {
+                    console.warn("ICE add error", e);
+                  }
+                }
+                break;
+
+              case "peer-left":
+                log("L’autre pair a quitté.");
+                cleanup(false);
+                break;
+            }
+          };
+        });
+      }
+
+      // --- Actions ---
+      els.createBtn.onclick = async () => {
+        roomId = (els.room.value || "").trim();
+        if (!roomId) {
+          alert("Choisis un ID de room (ex: room-1234)");
+          return;
+        }
+        isCreator = true;
+        await ensureMedia();
+        await connectWS();
+        createPeerConnection();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type: "offer", sdp: pc.localDescription });
+        els.hangupBtn.disabled = false;
+      };
+
+      els.joinBtn.onclick = async () => {
+        roomId = (els.room.value || "").trim();
+        if (!roomId) {
+          alert("Entre l’ID de room envoyé par le créateur");
+          return;
+        }
+        isCreator = false;
+        await connectWS();
+        await ensureMedia();
+        createPeerConnection();
+        els.hangupBtn.disabled = false;
+        // Le “joiner” attend de recevoir l’offre via WS, puis enverra l’answer automatiquement.
+      };
+
+      els.hangupBtn.onclick = () => {
+        send({ type: "leave" });
+        cleanup(true);
+      };
+
+      function cleanup(local = true) {
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+        if (localStream) {
+          localStream.getTracks().forEach((t) => t.stop());
+          localStream = null;
+          els.localVideo.srcObject = null;
+        }
+        els.remoteVideo.srcObject = null;
+        els.hangupBtn.disabled = true;
+        if (local && ws && ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      }
+
+      // Permet de fermer proprement si l’onglet part
+      window.addEventListener("beforeunload", () => {
+        try {
+          send({ type: "leave" });
+        } catch (e) {}
+        if (ws) ws.close();
+      });
+    </script>
+  </body>
+</html>
